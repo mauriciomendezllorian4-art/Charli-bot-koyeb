@@ -1,7 +1,7 @@
 from flask import Flask, request
 import os, json, time, threading, requests
 
-app = Flask(_name_)
+app = Flask(__name__)
 TG = os.environ.get("TELEGRAM_TOKEN")
 GROQ = os.environ.get("GROQ_API_KEY")
 TD = os.environ.get("TWELVEDATA_KEY")
@@ -313,7 +313,7 @@ def webhook():
                          daemon=True).start()
     return "OK", 200
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
     
