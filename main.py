@@ -14,33 +14,34 @@ TD_KEY = os.environ.get("TWELVEDATA_KEY")
 API_TELEGRAM = f"https://api.telegram.org/bot{TOKEN}"
 client = Groq(api_key=GROQ_KEY)
 
-ALERTAS = {} # chat_id: precio
+ALERTAS = {}
 
-# --- FUNCIONES BASE ---
 def get_precio_oro():
     try:
         url = f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={TD_KEY}"
         return requests.get(url, timeout=10).json().get("price")
     except: return None
 
-def get_historico(ticker):
+def get_historico_full(ticker="XAU/USD"):
+    # trae OHLC para velas estilo TradingView
     try:
         url = f"https://api.twelvedata.com/time_series?symbol={ticker}&interval=1day&outputsize=30&apikey={TD_KEY}"
         r = requests.get(url, timeout=15).json()
-        if "values" in r:
-            v = r["values"][::-1]
-            fechas = [x["datetime"][5:] for x in v]
-            precios = [float(x["close"]) for x in v]
-            return fechas, precios
-    except Exception as e: print(e)
+        return r.get("values", [])[::-1]
+    except: return []
+
+def get_historico(ticker):
+    vals = get_historico_full(ticker)
+    if vals:
+        fechas = [x["datetime"][5:] for x in vals]
+        precios = [float(x["close"]) for x in vals]
+        return fechas, precios
     return None, None
 
 def get_dolares():
     try:
         r = requests.get("https://dolarapi.com/v1/dolares", timeout=10).json()
-        # r es lista de dicts
-        d = {x["casa"]: x for x in r}
-        return d
+        return {x["casa"]: x for x in r}
     except: return None
 
 def calcular_rsi(precios, per=14):
@@ -58,27 +59,47 @@ def preguntar_a_ia(mensaje):
     resp = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": "Sos Charli, trader experto en oro y dolar argentino. Corto, argentino, sin humo."},
+            {"role": "system", "content": "Sos Charli, trader experto oro y dolar argentino. Corto, argentino."},
             {"role": "user", "content": mensaje}
         ]
     )
     return resp.choices[0].message.content
 
-def mandar_grafico(chat_id, fechas, precios, titulo):
-    plt.figure(figsize=(10,5))
-    plt.plot(fechas, precios, marker='o', linewidth=2)
-    plt.title(titulo)
-    plt.xticks(rotation=45)
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig("/tmp/grafico.png")
-    plt.close()
-    with open("/tmp/grafico.png","rb") as foto:
-        requests.post(f"{API_TELEGRAM}/sendPhoto", data={"chat_id": chat_id, "caption": titulo}, files={"photo": foto})
+def mandar_grafico_tradingview(chat_id, ticker="XAU/USD"):
+    vals = get_historico_full(ticker)
+    if not vals:
+        requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":"No pude traer velas, limite TwelveData."})
+        return
 
-# --- WEBHOOK ---
+    fechas = [v["datetime"][5:] for v in vals]
+    closes = [float(v["close"]) for v in vals]
+    opens = [float(v["open"]) for v in vals]
+
+    # Grafico estilo TradingView
+    plt.figure(figsize=(12,6))
+    plt.style.use('dark_background')
+    # velas simplificadas con color verde/rojo
+    for i in range(len(vals)):
+        color = '#26a69a' if closes[i] >= opens[i] else '#ef5350'
+        plt.plot([i,i],[float(vals[i]["low"]), float(vals[i]["high"])], color=color, linewidth=1)
+        plt.plot([i,i],[opens[i], closes[i]], color=color, linewidth=4)
+
+    plt.xticks(range(len(fechas)), fechas, rotation=45)
+    plt.title(f"{ticker} - TradingView Style - {closes[-1]} USD", color='white')
+    plt.grid(alpha=0.15)
+    plt.tight_layout()
+    plt.savefig("/tmp/tv.png", facecolor='#131722')
+    plt.close()
+
+    link_tv = f"https://www.tradingview.com/chart/?symbol=OANDA%3A{ticker.replace('/','')}" if "XAU" in ticker else "https://www.tradingview.com/symbols/USDARS/"
+
+    with open("/tmp/tv.png","rb") as foto:
+        requests.post(f"{API_TELEGRAM}/sendPhoto",
+            data={"chat_id": chat_id, "caption": f"📈 {ticker} {closes[-1]} USD\n🔗 Abrir en TradingView: {link_tv}\nRSI: {calcular_rsi(closes):.1f}"},
+            files={"photo": foto})
+
 @app.route("/")
-def home(): return "Charli PRO vivo"
+def home(): return "Charli PRO TV vivo"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -89,89 +110,71 @@ def webhook():
             text = data["message"]["text"]
             tl = text.lower()
 
-            # GRAFICO ORO
-            if "grafico oro" in tl or tl == "/grafico" or tl == "grafico":
-                f,p = get_historico("XAU/USD")
-                if p: mandar_grafico(chat_id,f,p,f"Oro {p[-1]} USD - 30 dias")
-                else: requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":"No pude traer historico oro, proba 1 min."})
-                return "ok",200
-
-            # GRAFICO DOLAR
-            if "grafico dolar" in tl or "grafico usd" in tl:
-                # Para dolar usamos blue de TwelveData? Usamos USD/ARS
-                f,p = get_historico("USD/ARS")
-                if p: mandar_grafico(chat_id,f,p,f"Dolar oficial aprox {p[-1]} ARS")
-                else: requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":"No pude traer grafico dolar"})
-                return "ok",200
-
-            # DOLAR
-            if "/dolar" in tl or "/usd" in tl or tl.startswith("dolar"):
-                d = get_dolares()
-                if not d:
-                    resp = "No pude traer dolar ahora"
+            # TRADINGVIEW
+            if "tradingview" in tl or tl.startswith("/tv") or tl == "tv":
+                if "dolar" in tl:
+                    mandar_grafico_tradingview(chat_id, "USD/ARS")
                 else:
-                    txt = ""
-                    for k in ["oficial","blue","bolsa","contadoconliqui","mayorista","cripto"]:
-                        if k in d:
-                            txt += f"{k.upper()}: ${d[k]['venta']} (compra ${d[k]['compra']})\n"
-                    resp = txt + "\n" + preguntar_a_ia(f"Dolar hoy: {txt}. Analiza en 3 lineas para Argentina.")
-                requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":resp})
+                    mandar_grafico_tradingview(chat_id, "XAU/USD")
                 return "ok",200
 
-            # ORO
+            if "grafico" in tl:
+                if "dolar" in tl:
+                    f,p = get_historico("USD/ARS")
+                    if p:
+                        plt.figure(figsize=(10,5)); plt.plot(f,p); plt.savefig("/tmp/g.png"); plt.close()
+                        with open("/tmp/g.png","rb") as foto: requests.post(f"{API_TELEGRAM}/sendPhoto", data={"chat_id":chat_id}, files={"photo":foto})
+                else:
+                    mandar_grafico_tradingview(chat_id, "XAU/USD")
+                return "ok",200
+
+            if "/dolar" in tl or "/usd" in tl:
+                d = get_dolares()
+                txt = "\n".join([f"{k.upper()}: ${v['venta']}" for k,v in d.items()]) if d else "Error dolar"
+                requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":txt})
+                return "ok",200
+
             if "/oro" in tl or tl.startswith("oro"):
                 p = get_precio_oro()
-                # chequear alertas
-                if chat_id in ALERTAS and p and float(p) >= float(ALERTAS[chat_id]):
-                    requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":f"🔔 ALERTA ORO! Llego a {p} USD (tu alerta {ALERTAS[chat_id]})"})
-                    del ALERTAS[chat_id]
                 r = preguntar_a_ia(f"Oro {p} USD. Explica en 3 lineas.") if p else "No pude traer oro"
                 requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":r})
                 return "ok",200
 
-            # ANALISIS
-            if "/analisis" in tl or "analisis" in tl:
+            if "/analisis" in tl:
                 f,p = get_historico("XAU/USD")
-                if p:
-                    rsi = calcular_rsi(p)
-                    estado = "SOBRECOMPRADO" if rsi>70 else "SOBREVENDIDO" if rsi<30 else "NEUTRAL"
-                    prompt = f"Oro ultimos precios {p[-5:]}, RSI {rsi:.1f} {estado}. Hace analisis tecnico corto con soporte y resistencia."
-                    r = preguntar_a_ia(prompt)
-                else: r="No pude hacer analisis"
+                rsi = calcular_rsi(p) if p else 50
+                r = preguntar_a_ia(f"Analisis oro RSI {rsi:.1f} precios {p[-5:]}")
                 requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":r})
                 return "ok",200
 
-            # ALERTA
             if "/alerta" in tl:
                 try:
                     precio = float(tl.replace("/alerta","").strip().split()[0])
-                    ALERTAS[chat_id] = precio
-                    r = f"Listo! Te aviso cuando oro llegue a {precio} USD"
-                except:
-                    r = "Usa: /alerta 4200"
+                    ALERTAS[chat_id]=precio
+                    r=f"Alerta puesta en {precio} USD"
+                except: r="Usa: /alerta 4200"
                 requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":r})
                 return "ok",200
 
-            # CONVERTIR
-            if "convertir" in tl or "cuanto es" in tl:
-                r = preguntar_a_ia(text)
-                requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":r})
-                return "ok",200
-
-            # CHAT LIBRE
             r = preguntar_a_ia(text)
             requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":chat_id,"text":r})
 
     except Exception as e:
         print(f"ERROR: {e}")
-        try: requests.post(f"{API_TELEGRAM}/sendMessage", json={"chat_id":data["message"]["chat"]["id"],"text":f"Error: {e}"})
-        except: pass
     return "ok",200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+          
+            
+              
+          
+              
+           
+                
+        
+          
     
-      
        
   
   
