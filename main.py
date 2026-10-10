@@ -1,44 +1,31 @@
+from flask import Flask, request
 import os
-import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from groq import Groq
 
-logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+@app.route('/')
+def home():
+    return "CHALI V17 SALTA ONLINE - OK", 200
 
-client = Groq(api_key=GROQ_API_KEY)
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    if request.method == 'GET':
+        # Verificacion de Meta
+        mode = request.args.get('hub.mode')
+        token = request.args.get('hub.verify_token')
+        challenge = request.args.get('hub.challenge')
+        if mode == 'subscribe' and token == 'CHALI123':
+            return challenge, 200
+        return 'Forbidden', 403
+    else:
+        # Aqui va tu logica del bot
+        print(request.json)
+        return 'OK', 200
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hola Mauri! Soy Charli-bot activo en Render 🤖")
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user_text = update.message.text
-        completion = client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=[
-                {"role": "system", "content": "Sos Charli, asistente del Taller Fiat en Santiago del Estero. Respondé corto y útil."},
-                {"role": "user", "content": user_text}
-            ],
-            temperature=0.7,
-            max_tokens=500
-        )
-        respuesta = completion.choices[0].message.content
-        await update.message.reply_text(respuesta)
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text(f"Error: {e}")
-
-if __name__ == '__main__':
-    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-        raise ValueError("Faltan TELEGRAM_TOKEN o GROQ_API_KEY en variables de entorno")
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-
-    print("Charli-bot iniciando polling...")
-    app.run_polling()
+            
+       
+  
