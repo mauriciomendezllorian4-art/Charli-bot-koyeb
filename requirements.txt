@@ -1,6 +1,2 @@
 flask
 gunicorn
-python-telegram-bot[job-queue]>=20
-groq
-requests
-tzdata
