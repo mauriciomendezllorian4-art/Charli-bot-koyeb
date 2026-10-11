@@ -13,7 +13,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
-MODELO_GROQ = "llama-3.3-70b-versatile" # CORREGIDO - el viejo 8b ya no existe
+# MODELO NUEVO QUE SI FUNCIONA - Groq borro los llama
+MODELO_GROQ = "openai/gpt-oss-20b"
 
 def get_btc_data():
     try:
@@ -21,8 +22,6 @@ def get_btc_data():
         r = requests.get(url, timeout=10).json()
         df = pd.DataFrame(r, columns=["open_time","open","high","low","close","vol","close_time","qav","trades","taker_base","taker_quote","ignore"])
         df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
         return df
     except:
         return None
@@ -30,30 +29,27 @@ def get_btc_data():
 def analisis_v20(symbol="BTC/USD"):
     df = get_btc_data()
     if df is None:
-        return None, "Error obteniendo datos"
+        return None, "Error Binance"
 
     precio = df["close"].iloc[-1]
     ema20 = df["close"].ewm(span=20).mean().iloc[-1]
     ema50 = df["close"].ewm(span=50).mean().iloc[-1]
 
-    # Logica V20 Charli
-    tendencia = "COMPRA" if precio > ema20 and ema20 > ema50 else "VENTA"
+    tendencia = "COMPRA" if precio > ema20 else "VENTA"
     sl = precio * 0.995 if tendencia == "COMPRA" else precio * 1.005
     tp = precio * 1.008 if tendencia == "COMPRA" else precio * 0.992
-    ent = precio
 
-    # Grafico
     plt.figure(figsize=(8,4))
     plt.plot(df["close"].tail(50).values, label="Precio", linewidth=2)
     plt.plot(df["close"].ewm(span=20).mean().tail(50).values, label="EMA20")
-    plt.title(f"CHALI V20 {symbol} {tendencia} - Precio {precio:.2f}")
+    plt.title(f"CHALI V20 {symbol} {tendencia} - {precio:.2f}")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig("/tmp/chart.png")
     plt.close()
 
-    texto = f"🤖 CHALI V20 {symbol} {tendencia}\nPrecio {precio:.2f}\nENT {ent:.2f} SL {sl:.2f} TP {tp:.2f}\nLote 0.02 Saldo $1000"
+    texto = f"🤖 CHALI V20 {symbol} {tendencia}\nPrecio {precio:.2f}\nENT {precio:.2f} SL {sl:.2f} TP {tp:.2f}\nLote 0.02 Saldo $1000"
     return "/tmp/chart.png", texto
 
 def consulta_groq(pregunta):
@@ -61,7 +57,7 @@ def consulta_groq(pregunta):
         completion = client.chat.completions.create(
             model=MODELO_GROQ,
             messages=[
-                {"role": "system", "content": "Sos Charli, experto en trading de ORO y BTC. Hablas como argentino, directo, trader rentable. Estrategia V20: EMA20/50, entradas en retroceso, SL 0.5%, TP 0.8%, gestión 0.02 lote por cada 1000 USD. Das consejos claros."},
+                {"role": "system", "content": "Sos Charli, experto en trading ORO y BTC. Argentino, directo, trader rentable. Estrategia V20: EMA20/50, SL 0.5% TP 0.8%"},
                 {"role": "user", "content": pregunta}
             ],
             temperature=0.7,
@@ -69,7 +65,7 @@ def consulta_groq(pregunta):
         )
         return completion.choices[0].message.content
     except Exception as e:
-        return f"Lag groq Error code: {e}"
+        return f"Error groq: {e}"
 
 def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -82,45 +78,30 @@ def send_photo(chat_id, photo_path, caption):
 
 @app.route("/")
 def home():
-    return "Charli V20 Bot Live!"
+    return "Charli V20 Live!"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
     if "message" in data:
         chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "").lower()
+        text_user = data["message"].get("text", "")
+        text_low = text_user.lower()
 
-        if "/v20" in text or "btc" in text and "/v20" in text:
+        if "/v20" in text_low:
             path, txt = analisis_v20("BTC/USD")
-            if path:
-                send_photo(chat_id, path, txt)
-            else:
-                send_message(chat_id, txt)
-        elif "/oro" in text or "oro" in text and "v20" in text:
+            send_photo(chat_id, path, txt) if path else send_message(chat_id, txt)
+        elif "/oro" in text_low:
             path, txt = analisis_v20("ORO/USD")
-            if path:
-                send_photo(chat_id, path, txt)
-            else:
-                send_message(chat_id, txt)
-        elif "/script" in text:
-            script = """// @version=5
-strategy("CHALI V20", overlay=true)
-ema20 = ta.ema(close, 20)
-ema50 = ta.ema(close, 50)
-long = close > ema20 and ema20 > ema50
-short = close < ema20 and ema20 < ema50
-strategy.entry("Compra", strategy.long, when=long)
-strategy.entry("Venta", strategy.short, when=short)
-plot(ema20, color=color.yellow)
-plot(ema50, color=color.orange)
-"""
-            send_message(chat_id, f"📜 Pine Script V20:\n{script}")
+            send_photo(chat_id, path, txt) if path else send_message(chat_id, txt)
+        elif "/v21" in text_low:
+            path, txt = analisis_v20("BTC/USD")
+            send_photo(chat_id, path, txt) if path else send_message(chat_id, txt)
+        elif "/script" in text_low:
+            send_message(chat_id, "Pine V20: ema20 = ta.ema(close,20) ema50=ta.ema(close,50)")
         else:
-            # Cualquier otra pregunta va a Groq
-            resp = consulta_groq(data["message"].get("text",""))
+            resp = consulta_groq(text_user)
             send_message(chat_id, resp)
-
     return "ok", 200
 
 if __name__ == "__main__":
