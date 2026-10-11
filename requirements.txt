@@ -1,6 +1,5 @@
 Flask
 requests
-groq
 matplotlib
 pandas
 numpy    
