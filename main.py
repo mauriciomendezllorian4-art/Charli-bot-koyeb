@@ -12,6 +12,7 @@
 #   COSTO_ORO, COSTO_BTC  (opcional; spread+comisión en precio, p.ej. 0.40 / 15)
 #   TZ_OFFSET_HORAS       (opcional; Argentina = -3)
 #   AUTO_SCAN=1           (opcional; escanea cada 15 min y te avisa)
+#   ICHI_MODO=puntaje     (nube Ichimoku: off | puntaje | filtro)
 #   DATABASE_PATH         (opcional; /var/data/chali.db si hay disco)
 # ============================================================
 
@@ -69,6 +70,9 @@ BALANCE = env_float("ACCOUNT_BALANCE", 0)
 RISK_PCT = env_float("RISK_PCT", 1)
 TZ_OFFSET = int(env_float("TZ_OFFSET_HORAS", -3))
 AUTO_SCAN = env("AUTO_SCAN") == "1"
+ICHI_MODO = env("ICHI_MODO", "puntaje").lower()  # off | puntaje | filtro
+if ICHI_MODO not in ("off", "puntaje", "filtro"):
+    ICHI_MODO = "puntaje"
 
 COSTO = {
     "ORO": env_float("COSTO_ORO", 0.40),
@@ -81,7 +85,7 @@ MERCADOS = {
 }
 
 CHART_DIR = "/tmp"
-UMBRAL_SCORE = 6      # puntaje mínimo (de 9) para emitir señal
+UMBRAL_SCORE = 6      # puntaje mínimo para emitir señal (máx 9, o 10 con nube)
 RR1, RR2 = 1.5, 3.0   # TP1 y TP2 en múltiplos de R
 R_TP1 = 0.5 * RR1     # cierra 50% en TP1
 R_TP2 = R_TP1 + 0.5 * RR2
@@ -352,6 +356,25 @@ def sesgo(d):
     return 0
 
 
+def posicion_nube(df):
+    """Nube Ichimoku igual que el Pine (9/26/52, desplazada 25 velas).
+    Devuelve 1 si el cierre está arriba, -1 abajo, 0 dentro."""
+    h, l = df["high"], df["low"]
+
+    def donch(n):
+        return (h.rolling(n).max() + l.rolling(n).min()) / 2
+
+    lead_a = (donch(9) + donch(26)) / 2
+    lead_b = donch(52)
+    ambas = pd.concat([lead_a, lead_b], axis=1)
+    top = ambas.max(axis=1).shift(25).iat[-1]
+    bot = ambas.min(axis=1).shift(25).iat[-1]
+    if not (np.isfinite(top) and np.isfinite(bot)):
+        return 0
+    c = float(df["close"].iat[-1])
+    return 1 if c > top else -1 if c < bot else 0
+
+
 def pivotes(df, n=3):
     h, l = df["high"].values, df["low"].values
     altos, bajos = [], []
@@ -463,7 +486,7 @@ def noticia_cercana(minutos=30):
 
 # ---------------- MOTOR DE SEÑALES ----------------
 
-def generar_senal(df15, mercado, live=True):
+def generar_senal(df15, mercado, live=True, ichi=None):
     """Función pura sobre velas de 15m. Se usa igual en vivo y en backtest."""
     df = indicadores(df15)
     if len(df) < 300:
@@ -479,6 +502,9 @@ def generar_senal(df15, mercado, live=True):
     est = estructura(df)
     b4, b1 = sesgo(h4), sesgo(h1)
     ses = sesion(ts)
+    modo = ichi or ICHI_MODO
+    nube = posicion_nube(df)
+    maxs = 9 if modo == "off" else 10
 
     # ---- puntaje de confluencia (máx. 9) ----
     d = {"ALCISTA": 1, "BAJISTA": -1}.get(est["ruptura"], 0)
@@ -506,6 +532,16 @@ def generar_senal(df15, mercado, live=True):
         if ses in ("LONDRES", "NY (solape)", "NY"):
             score += 1
             razones.append(f"sesión {ses}")
+        if modo != "off":
+            if nube == d:
+                score += 1
+                razones.append("precio fuera de la nube a favor")
+            elif nube == -d:
+                score -= 2
+                razones.append("nube Ichimoku en contra")
+            else:
+                score -= 1
+                razones.append("precio dentro de la nube")
 
     # ---- filtros de riesgo ----
     nota = None
@@ -535,7 +571,8 @@ def generar_senal(df15, mercado, live=True):
          "rsi": rsi, "b4": b4, "b1": b1, "est": est, "sesion": ses,
          "score": score, "razones": razones, "direccion": 0,
          "senal": "ESPERAR", "entrada": None, "sl": None, "tp1": None,
-         "tp2": None, "nota": nota, "df": df}
+         "tp2": None, "nota": nota, "df": df,
+         "nube": nube, "max": maxs, "modo": modo}
 
     if nota:
         return s
@@ -543,7 +580,11 @@ def generar_senal(df15, mercado, live=True):
         s["nota"] = "Sin ruptura de estructura reciente en 15m"
         return s
     if score < UMBRAL_SCORE:
-        s["nota"] = f"Confluencia insuficiente ({score}/9, mínimo {UMBRAL_SCORE})"
+        s["nota"] = (f"Confluencia insuficiente ({score}/{maxs}, "
+                     f"mínimo {UMBRAL_SCORE})")
+        return s
+    if modo == "filtro" and nube != d:
+        s["nota"] = "Filtro Ichimoku: el precio no está del lado correcto de la nube"
         return s
 
     # ---- niveles: SL estructural acotado por ATR ----
@@ -681,13 +722,12 @@ def texto_estadisticas():
     return "\n\n".join(partes)
 
 
-def backtest(mercado, n=3000, ventana=900, paso=4):
-    df = obtener_velas(mercado, n, ttl=0)
+def correr_backtest(df, mercado, modo, ventana=900, paso=4):
     resultados, i = [], ventana
     while i < len(df) - 2:
         sub = df.iloc[max(0, i - ventana):i + 1]
         try:
-            s = generar_senal(sub, mercado, live=False)
+            s = generar_senal(sub, mercado, live=False, ichi=modo)
         except Exception:
             i += paso
             continue
@@ -701,10 +741,18 @@ def backtest(mercado, n=3000, ventana=900, paso=4):
         riesgo = abs(s["entrada"] - s["sl"])
         resultados.append(r - COSTO[mercado] / riesgo)
         i += k + 2
+    return resultados
+
+
+def backtest(mercado, n=3000, ventana=900, modos=None):
+    df = obtener_velas(mercado, n, ttl=0)
+    modos = modos or [ICHI_MODO]
     desde, hasta = df["time"].iat[ventana], df["time"].iat[-1]
     cab = (f"BACKTEST {mercado} 15m\nPeríodo: {desde:%d/%m/%Y} a "
            f"{hasta:%d/%m/%Y}\nCostos: {COSTO[mercado]} por operación\n")
-    return (cab + stats_texto(resultados, "Resultado") +
+    cuerpos = [stats_texto(correr_backtest(df, mercado, m, ventana),
+                           f"Nube Ichimoku: {m}") for m in modos]
+    return (cab + "\n\n".join(cuerpos) +
             "\n\nOjo: evaluación cada hora, SL gana si toca TP y SL en la "
             "misma vela, sin noticias. Es un período corto: sirve para "
             "descartar ideas malas, no para confirmar que funciona.")
@@ -772,12 +820,13 @@ def grafico(s, mercado):
 def armar_informe(s, mercado):
     est = s["est"]
     sb = {1: "ALCISTA", -1: "BAJISTA", 0: "NEUTRO"}
+    nb = {1: "ARRIBA", -1: "ABAJO", 0: "DENTRO"}
     L = [f"CHALI IA - {MERCADOS[mercado]['nombre']} | 15m",
          f"Vela: {hora_local(s['ts'])} (hora local) | Sesión: {s['sesion']}",
          f"Precio: {fmt(s['precio'])}", ""]
     if s["direccion"] != 0:
         dist = abs(s["entrada"] - s["sl"])
-        L += [f"SEÑAL: {s['senal']} (puntaje {s['score']}/9)",
+        L += [f"SEÑAL: {s['senal']} (puntaje {s['score']}/{s['max']})",
               f"Entrada ref: {fmt(s['entrada'])}",
               f"SL: {fmt(s['sl'])} ({dist:,.2f} pts)",
               f"TP1: {fmt(s['tp1'])} ({RR1:g}R, cerrar 50% y SL a entrada)",
@@ -788,9 +837,10 @@ def armar_informe(s, mercado):
             L.append(t)
     else:
         L += ["SEÑAL: ESPERAR", f"Motivo: {s['nota']}",
-              f"Confluencia: {s['score']}/9"]
+              f"Confluencia: {s['score']}/{s['max']}"]
     L += ["",
           f"Sesgo 4h: {sb[s['b4']]} | 1h: {sb[s['b1']]}",
+          f"Nube Ichimoku 15m: {nb[s['nube']]} de la nube (modo {s['modo']})",
           f"Estructura 15m: {est['tendencia']} | Ruptura: "
           f"{(est['tipo'] + ' ' + est['ruptura'].lower()) if est['ruptura'] else 'ninguna'}",
           f"RSI {s['rsi']:.1f} | ATR {fmt(s['atr'])}",
@@ -861,7 +911,8 @@ def comentario_ia(s, mercado):
     est = s["est"]
     ctx = {"mercado": MERCADOS[mercado]["nombre"], "precio": s["precio"],
            "senal": s["senal"], "motivo_espera": s["nota"],
-           "score": f"{s['score']}/9", "sesgo_4h": s["b4"], "sesgo_1h": s["b1"],
+           "score": f"{s['score']}/{s['max']}", "nube": s["nube"],
+           "sesgo_4h": s["b4"], "sesgo_1h": s["b1"],
            "estructura": est["tendencia"], "ruptura": est["ruptura"],
            "tipo": est["tipo"], "rsi": round(s["rsi"], 1),
            "atr": round(s["atr"], 2), "sesion": s["sesion"],
@@ -948,7 +999,8 @@ AYUDA = (
     "/oro  /btc  /mercados - análisis con gráfico\n"
     "/abiertas - señales en seguimiento\n"
     "/estadisticas - resultados reales de mis señales\n"
-    "/backtest oro|btc - prueba la estrategia con historial\n"
+    "/backtest oro|btc [comparar] - prueba con historial; comparar = "
+    "con y sin nube Ichimoku\n"
     "/noticia AAAA-MM-DD HH:MM texto - bloquea señales ±30 min "
     "(hora local)\n"
     "/noticias - ver noticias cargadas\n"
@@ -1031,14 +1083,20 @@ def procesar_mensaje(chat_id, texto):
             or "No hay noticias próximas cargadas.")
         return
     if cmd == "/backtest":
-        m = arg.upper()
-        if m not in MERCADOS:
-            enviar_texto(chat_id, "Usá: /backtest oro  o  /backtest btc")
+        a = arg.upper().split()
+        m = a[0] if a else ""
+        extra = a[1].lower() if len(a) > 1 else ""
+        if m not in MERCADOS or extra not in ("", "comparar", "off",
+                                              "puntaje", "filtro"):
+            enviar_texto(chat_id, "Usá: /backtest oro|btc "
+                                  "[comparar|off|puntaje|filtro]")
             return
+        modos = (["off", "puntaje", "filtro"] if extra == "comparar"
+                 else [extra] if extra else None)
         enviar_texto(chat_id, f"Corriendo backtest de {m}. Puede tardar "
-                              "unos minutos...")
+                              "varios minutos...")
         try:
-            enviar_texto(chat_id, backtest(m))
+            enviar_texto(chat_id, backtest(m, modos=modos))
         except Exception as e:
             enviar_texto(chat_id, f"Falló el backtest: {limpiar(e)[:300]}")
         return
