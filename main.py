@@ -1,483 +1,873 @@
+# ============================================================
+# CHALI IA - ORO + BTC - RENDER
+# Telegram + Groq + memoria SQLite + gráficos + análisis SMC
+# ============================================================
+
 import os
+import time
+import json
 import sqlite3
+import logging
+import threading
+from datetime import datetime, timezone
+from urllib.parse import quote
+
 import requests
+import numpy as np
+import pandas as pd
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from flask import Flask, request
-from groq import Groq
+import matplotlib.dates as mdates
+
+from flask import Flask, request, jsonify
+
+# ---------------- CONFIGURACION ----------------
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# CONFIGURACION
-TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-GROQ_KEY = os.getenv("GROQ_API_KEY", "")
-TD_KEY = os.getenv("TWELVEDATA_API_KEY", "")
-MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
-DB_PATH = os.getenv("DATABASE_PATH", "/var/data/chali.db")
-if not os.path.isdir(os.path.dirname(DB_PATH)):
-    DB_PATH = "/tmp/chali.db"
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL", "llama-3.3-70b-versatile"
+).strip()
 
-ia = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv(
+    "TELEGRAM_WEBHOOK_SECRET", ""
+).strip()
 
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/var/data/chali.db")
+if not os.path.isdir(os.path.dirname(DATABASE_PATH) or "."):
+    DATABASE_PATH = "/tmp/chali.db"
 
-# BASE DE DATOS Y MEMORIA
-def conectar():
-    carpeta = os.path.dirname(DB_PATH)
-    if carpeta:
-        os.makedirs(carpeta, exist_ok=True)
-    return sqlite3.connect(DB_PATH, timeout=20)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHART_DIR = "/tmp"
+TIMEFRAME = "15m"
 
-
-def iniciar():
-    with conectar() as db:
-        db.execute("""
-        CREATE TABLE IF NOT EXISTS mensajes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat TEXT, rol TEXT, texto TEXT)
-        """)
-        db.execute("""
-        CREATE TABLE IF NOT EXISTS recuerdos(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat TEXT, texto TEXT)
-        """)
-        db.execute("""
-        CREATE TABLE IF NOT EXISTS resultados(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat TEXT, resultado TEXT)
-        """)
+session = requests.Session()
+db_lock = threading.RLock()
 
 
-iniciar()
+# ---------------- MEMORIA SQLITE ----------------
+
+def conectar_db():
+    con = sqlite3.connect(DATABASE_PATH, timeout=20)
+    con.execute("PRAGMA busy_timeout=20000")
+    return con
 
 
-def guardar(chat, rol, texto):
-    with conectar() as db:
-        db.execute(
-            "INSERT INTO mensajes(chat,rol,texto) VALUES(?,?,?)",
-            (str(chat), rol, texto[:6000])
-        )
-
-
-def memoria(chat):
-    with conectar() as db:
-        filas = db.execute(
-            "SELECT id,texto FROM recuerdos WHERE chat=? "
-            "ORDER BY id DESC LIMIT 20", (str(chat),)
-        ).fetchall()
-    return "\n".join(f"{i}. {t}" for i, t in filas) or "Sin recuerdos."
-
-
-def historial(chat):
-    with conectar() as db:
-        filas = db.execute(
-            "SELECT rol,texto FROM mensajes WHERE chat=? "
-            "ORDER BY id DESC LIMIT 10", (str(chat),)
-        ).fetchall()
-    return [{"role": r, "content": t} for r, t in reversed(filas)]
-
-
-def enviar(chat, texto):
-    if not TOKEN:
-        print("Falta TELEGRAM_TOKEN")
-        return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": chat, "text": str(texto)[:4000]},
-            timeout=20
-        )
-        r.raise_for_status()
-    except Exception as e:
-        print("Telegram:", repr(e))
-
-
-def enviar_grafico(chat, texto, archivo):
-    try:
-        with open(archivo, "rb") as foto:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-                data={"chat_id": chat, "caption": texto[:1000]},
-                files={"photo": foto},
-                timeout=30
+def iniciar_db():
+    with db_lock:
+        con = conectar_db()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS mensajes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT,
+                rol TEXT,
+                contenido TEXT,
+                fecha TEXT
             )
-        r.raise_for_status()
-        enviar(chat, texto)  # Envia el informe completo
-    except Exception as e:
-        print("Error grafico:", repr(e))
-        enviar(chat, texto)
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS recuerdos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT,
+                recuerdo TEXT,
+                fecha TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS resultados (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mercado TEXT,
+                senal TEXT,
+                entrada REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                fecha TEXT
+            )
+        """)
+        con.commit()
+        con.close()
 
 
-# IA GENERAL
-def preguntar(chat, pregunta):
-    if not ia:
-        return "Falta GROQ_API_KEY en las variables de Render."
-
-    sistema = """
-Eres CHALI IA, asistente personal en español.
-Ayudas con trading y preguntas generales.
-Analiza SMC, estructura, BOS, CHOCH, liquidez,
-Order Blocks, FVG, soportes, resistencias y riesgo.
-No inventes cotizaciones ni garantices ganancias.
-No afirmes haber ejecutado operaciones.
-La memoria aporta contexto, no entrena automaticamente el modelo.
-"""
-
-    mensajes = [{
-        "role": "system",
-        "content": sistema + "\nMemoria del usuario:\n" + memoria(chat)
-    }]
-    mensajes.extend(historial(chat))
-    mensajes.append({"role": "user", "content": pregunta[:4000]})
-
+def guardar_mensaje(chat_id, rol, contenido):
     try:
-        r = ia.chat.completions.create(
-            model=MODEL,
-            messages=mensajes,
-            temperature=0.3,
-            max_tokens=1000
+        with db_lock:
+            con = conectar_db()
+            con.execute(
+                """INSERT INTO mensajes
+                (chat_id, rol, contenido, fecha)
+                VALUES (?, ?, ?, ?)""",
+                (
+                    str(chat_id),
+                    rol,
+                    str(contenido)[:12000],
+                    datetime.now(timezone.utc).isoformat()
+                )
+            )
+            con.commit()
+            con.close()
+    except Exception:
+        logging.exception("Error guardando mensaje")
+
+
+def guardar_recuerdo(chat_id, recuerdo):
+    with db_lock:
+        con = conectar_db()
+        con.execute(
+            """INSERT INTO recuerdos (chat_id, recuerdo, fecha)
+            VALUES (?, ?, ?)""",
+            (
+                str(chat_id),
+                recuerdo[:2000],
+                datetime.now(timezone.utc).isoformat()
+            )
         )
-        respuesta = r.choices[0].message.content or "Sin respuesta."
-        guardar(chat, "user", pregunta)
-        guardar(chat, "assistant", respuesta)
-        return respuesta
-    except Exception as e:
-        print("Groq:", repr(e))
-        return "Error de Groq. Revisa la API key y el modelo."
+        con.commit()
+        con.close()
 
 
-# OBTENER VELAS DE MERCADO
-def obtener_velas(mercado):
-    if mercado == "BTC":
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "15m", "limit": 100},
-            timeout=20
+def obtener_memoria(chat_id, limite=12):
+    with db_lock:
+        con = conectar_db()
+
+        recuerdos = con.execute(
+            """SELECT recuerdo FROM recuerdos
+            WHERE chat_id = ? ORDER BY id DESC LIMIT 15""",
+            (str(chat_id),)
+        ).fetchall()
+
+        mensajes = con.execute(
+            """SELECT rol, contenido FROM mensajes
+            WHERE chat_id = ? ORDER BY id DESC LIMIT ?""",
+            (str(chat_id), limite)
+        ).fetchall()
+
+        con.close()
+
+    recuerdos_texto = "\n".join(
+        "- " + fila[0] for fila in reversed(recuerdos)
+    )
+    mensajes_texto = [
+        {"role": rol, "content": contenido}
+        for rol, contenido in reversed(mensajes)
+        if rol in ("user", "assistant")
+    ]
+
+    return recuerdos_texto, mensajes_texto
+
+
+def guardar_resultado(mercado, analisis):
+    try:
+        with db_lock:
+            con = conectar_db()
+            con.execute(
+                """INSERT INTO resultados
+                (mercado, senal, entrada, sl, tp1, tp2, fecha)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mercado,
+                    analisis["senal"],
+                    analisis["entrada"],
+                    analisis["sl"],
+                    analisis["tp1"],
+                    analisis["tp2"],
+                    datetime.now(timezone.utc).isoformat()
+                )
+            )
+            con.commit()
+            con.close()
+    except Exception:
+        logging.exception("Error guardando resultado")
+
+
+iniciar_db()
+
+
+# ---------------- TELEGRAM ----------------
+
+def telegram_api(metodo, datos=None, archivos=None, timeout=30):
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Falta TELEGRAM_TOKEN en Render")
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN + "/" + metodo
+    )
+
+    respuesta = session.post(
+        url,
+        data=datos,
+        files=archivos,
+        timeout=timeout
+    )
+    respuesta.raise_for_status()
+    resultado = respuesta.json()
+
+    if not resultado.get("ok"):
+        raise RuntimeError(str(resultado))
+
+    return resultado
+
+
+def enviar_texto(chat_id, texto):
+    texto = str(texto)
+    if not texto:
+        return
+
+    # Telegram permite hasta 4096 caracteres por mensaje.
+    partes = [
+        texto[i:i + 3900]
+        for i in range(0, len(texto), 3900)
+    ]
+
+    for parte in partes:
+        telegram_api(
+            "sendMessage",
+            {
+                "chat_id": str(chat_id),
+                "text": parte
+            }
         )
-        r.raise_for_status()
-        datos = r.json()
-        velas = [{
-            "o": float(x[1]), "h": float(x[2]),
-            "l": float(x[3]), "c": float(x[4])
-        } for x in datos]
-        return velas, "BTCUSDT", "USDT"
 
-    if mercado == "ORO":
-        if not TD_KEY:
-            raise ValueError("Falta TWELVEDATA_API_KEY en Render.")
 
-        r = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": "XAU/USD",
-                "interval": "15min",
-                "outputsize": 100,
-                "apikey": TD_KEY
-            },
-            timeout=25
+def enviar_grafico(chat_id, ruta, informe):
+    if os.path.exists(ruta):
+        with open(ruta, "rb") as foto:
+            telegram_api(
+                "sendPhoto",
+                data={
+                    "chat_id": str(chat_id),
+                    "caption": informe[:950]
+                },
+                archivos={"photo": foto}
+            )
+
+        if len(informe) > 950:
+            enviar_texto(chat_id, informe[950:])
+    else:
+        enviar_texto(chat_id, informe)
+
+
+# ---------------- DATOS DE MERCADO ----------------
+
+def obtener_btc():
+    url = "https://api.binance.com/api/v3/klines"
+    respuesta = session.get(
+        url,
+        params={
+            "symbol": "BTCUSDT",
+            "interval": TIMEFRAME,
+            "limit": 180
+        },
+        timeout=20
+    )
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    if not isinstance(datos, list) or len(datos) < 60:
+        raise ValueError("Binance no devolvió suficientes velas BTC")
+
+    df = pd.DataFrame(datos, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+
+    df["time"] = pd.to_datetime(
+        df["time"], unit="ms", utc=True
+    )
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df[["time", "open", "high", "low", "close", "volume"]].dropna()
+
+
+def obtener_oro():
+    if not TWELVEDATA_API_KEY:
+        raise RuntimeError("Falta TWELVEDATA_API_KEY en Render")
+
+    url = "https://api.twelvedata.com/time_series"
+
+    respuesta = session.get(
+        url,
+        params={
+            "symbol": "XAU/USD",
+            "interval": TIMEFRAME,
+            "outputsize": 180,
+            "apikey": TWELVEDATA_API_KEY,
+            "format": "JSON",
+            "order": "ASC"
+        },
+        timeout=25
+    )
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    if "values" not in datos:
+        raise ValueError(
+            "Twelve Data: " +
+            str(datos.get("message", datos.get("status", datos)))[:500]
         )
-        r.raise_for_status()
-        datos = r.json()
 
-        if "values" not in datos:
-            raise ValueError(datos.get("message", "Error Twelve Data."))
+    df = pd.DataFrame(datos["values"])
+    df["time"] = pd.to_datetime(df["datetime"], utc=True)
 
-        velas = [{
-            "o": float(x["open"]), "h": float(x["high"]),
-            "l": float(x["low"]), "c": float(x["close"])
-        } for x in reversed(datos["values"])]
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return velas, "XAU/USD", "USD"
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
 
-    raise ValueError("Mercado desconocido.")
+    df = df[["time", "open", "high", "low", "close", "volume"]]
+    return df.sort_values("time").dropna().reset_index(drop=True)
 
 
-# ANALISIS SMC
-def analizar(mercado):
-    velas, nombre, moneda = obtener_velas(mercado)
+# ---------------- INDICADORES Y ESTRUCTURA ----------------
 
-    if len(velas) < 55:
-        raise ValueError("Faltan velas para el analisis.")
+def calcular_indicadores(df):
+    df = df.copy()
 
-    o = [v["o"] for v in velas]
-    h = [v["h"] for v in velas]
-    l = [v["l"] for v in velas]
-    c = [v["c"] for v in velas]
-    n = len(c)
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    def ema(valores, periodo):
-        k = 2 / (periodo + 1)
-        salida = [valores[0]]
-        for x in valores[1:]:
-            salida.append(k * x + (1-k) * salida[-1])
-        return salida
+    delta = df["close"].diff()
+    ganancias = delta.clip(lower=0)
+    perdidas = -delta.clip(upper=0)
 
-    e20 = ema(c, 20)
-    e50 = ema(c, 50)
+    media_g = ganancias.ewm(alpha=1/14, adjust=False).mean()
+    media_p = perdidas.ewm(alpha=1/14, adjust=False).mean()
 
-    # ATR
-    tr = []
-    for i in range(1, n):
-        tr.append(max(
-            h[i] - l[i],
-            abs(h[i] - c[i-1]),
-            abs(l[i] - c[i-1])
-        ))
-    atr = sum(tr[-14:]) / min(14, len(tr))
-    precio = c[-1]
+    rs = media_g / media_p.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
 
-    # Pivotes confirmados
-    ph, pl = [], []
-    for i in range(2, n-2):
-        if h[i] > max(h[i-2:i]) and h[i] >= max(h[i+1:i+3]):
-            ph.append(i)
-        if l[i] < min(l[i-2:i]) and l[i] <= min(l[i+1:i+3]):
-            pl.append(i)
+    anterior = df["close"].shift(1)
 
-    # BOS
-    bos = "Sin ruptura confirmada"
-    if ph and c[-1] > h[ph[-1]]:
+    rango = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - anterior).abs(),
+        (df["low"] - anterior).abs()
+    ], axis=1).max(axis=1)
+
+    df["atr"] = rango.ewm(span=14, adjust=False).mean()
+
+    return df
+
+
+def detectar_estructura(df):
+    ult = df.iloc[-1]
+    ventana = df.iloc[-21:-1]
+
+    maximo = float(ventana["high"].max())
+    minimo = float(ventana["low"].min())
+    cierre = float(ult["close"])
+
+    if cierre > maximo:
         bos = "BOS ALCISTA"
-    elif pl and c[-1] < l[pl[-1]]:
+    elif cierre < minimo:
         bos = "BOS BAJISTA"
+    else:
+        bos = "Sin ruptura confirmada"
 
-    # CHOCH aproximado: ruptura opuesta al sesgo anterior
-    choch = "Sin CHOCH detectado"
-    if bos == "BOS ALCISTA" and e20[-10] < e50[-10]:
-        choch = "Posible CHOCH ALCISTA"
-    elif bos == "BOS BAJISTA" and e20[-10] > e50[-10]:
-        choch = "Posible CHOCH BAJISTA"
+    # CHOCH aproximado: cambio de dirección respecto a las EMAs.
+    previo = df.iloc[-2]
+    tendencia_previa = (
+        "ALCISTA" if previo["ema20"] > previo["ema50"] else "BAJISTA"
+    )
+    tendencia_actual = (
+        "ALCISTA" if ult["ema20"] > ult["ema50"] else "BAJISTA"
+    )
 
-    # Order Block: ultima vela contraria antes de ruptura
-    ob = None
-    if bos == "BOS ALCISTA":
-        for i in range(n-2, max(-1, n-16), -1):
-            if c[i] < o[i]:
-                ob = (l[i], h[i], "OB ALCISTA")
-                break
-    elif bos == "BOS BAJISTA":
-        for i in range(n-2, max(-1, n-16), -1):
-            if c[i] > o[i]:
-                ob = (l[i], h[i], "OB BAJISTA")
-                break
+    if tendencia_actual != tendencia_previa:
+        choch = "Posible CHOCH"
+    else:
+        choch = "Sin CHOCH confirmado"
 
-    # Zonas de liquidez estimada: maximos/minimos repetidos
-    def liquidez(indices, valores):
-        if len(indices) < 2:
-            return None
-        recientes = [valores[i] for i in indices[-8:]]
-        ultimo = recientes[-1]
-        cercanos = [x for x in recientes if abs(x-ultimo) <= atr*0.35]
-        return sum(cercanos)/len(cercanos) if len(cercanos) >= 2 else None
+    # Zonas de liquidez estimadas por máximos y mínimos recientes.
+    liquidez_compra = maximo
+    liquidez_venta = minimo
 
-    liq_alta = liquidez(ph, h)
-    liq_baja = liquidez(pl, l)
+    # Order Block aproximado: última vela contraria de las últimas 10.
+    ob = "No detectado"
+    ob_zona = None
 
-    # Rebote aproximado cerca de OB o pivotes
-    rebote = "Sin rebote identificado"
-    if ob and ob[0] - atr*0.2 <= precio <= ob[1] + atr*0.2:
-        rebote = "Precio cerca de " + ob[2]
-    elif pl and abs(precio-l[pl[-1]]) <= atr*0.3:
-        rebote = "Posible rebote en soporte"
-    elif ph and abs(precio-h[ph[-1]]) <= atr*0.3:
-        rebote = "Posible rechazo en resistencia"
+    ultimas = df.iloc[-11:-1]
 
-    # Senal orientativa
-    direccion = "ESPERAR"
-    entrada = sl = tp1 = tp2 = tp3 = None
+    if cierre > maximo:
+        candidatas = ultimas[ultimas["close"] < ultimas["open"]]
+        if not candidatas.empty:
+            vela = candidatas.iloc[-1]
+            ob = "Posible OB alcista"
+            ob_zona = (
+                float(vela["low"]),
+                float(vela["high"])
+            )
 
-    alcista = e20[-1] > e50[-1] and precio > e20[-1]
-    bajista = e20[-1] < e50[-1] and precio < e20[-1]
+    elif cierre < minimo:
+        candidatas = ultimas[ultimas["close"] > ultimas["open"]]
+        if not candidatas.empty:
+            vela = candidatas.iloc[-1]
+            ob = "Posible OB bajista"
+            ob_zona = (
+                float(vela["low"]),
+                float(vela["high"])
+            )
 
-    if alcista and bos != "BOS BAJISTA":
-        direccion = "COMPRA POSIBLE"
+    return {
+        "bos": bos,
+        "choch": choch,
+        "ob": ob,
+        "ob_zona": ob_zona,
+        "liquidez_compra": liquidez_compra,
+        "liquidez_venta": liquidez_venta
+    }
+
+
+# ---------------- ANALISIS Y GRAFICO ----------------
+
+def fmt(precio):
+    if precio is None:
+        return "N/D"
+    return f"{precio:.2f}"
+
+
+def analizar(mercado):
+    mercado = mercado.upper()
+
+    if mercado in ("ORO", "XAU", "XAUUSD"):
+        nombre = "ORO XAU/USD"
+        df = obtener_oro()
+        archivo = os.path.join(CHART_DIR, "chali_oro.png")
+    elif mercado in ("BTC", "BTCUSD", "BTCUSDT", "BITCOIN"):
+        nombre = "BTC/USDT"
+        df = obtener_btc()
+        archivo = os.path.join(CHART_DIR, "chali_btc.png")
+    else:
+        raise ValueError("Mercado desconocido")
+
+    df = calcular_indicadores(df)
+
+    if len(df) < 55:
+        raise ValueError("No hay suficientes velas para analizar")
+
+    ult = df.iloc[-1]
+    precio = float(ult["close"])
+    atr = float(ult["atr"])
+
+    if not np.isfinite(atr) or atr <= 0:
+        raise ValueError("No se pudo calcular el ATR")
+
+    estructura = detectar_estructura(df)
+
+    # Señal básica por tendencia, RSI y ruptura.
+    tendencia_alcista = ult["ema20"] > ult["ema50"]
+    tendencia_bajista = ult["ema20"] < ult["ema50"]
+    rsi = float(ult["rsi"])
+
+    ruptura_alcista = estructura["bos"] == "BOS ALCISTA"
+    ruptura_bajista = estructura["bos"] == "BOS BAJISTA"
+
+    if tendencia_alcista and 45 <= rsi <= 68 and ruptura_alcista:
+        senal = "COMPRA"
+        direccion = 1
+    elif tendencia_bajista and 32 <= rsi <= 55 and ruptura_bajista:
+        senal = "VENTA"
+        direccion = -1
+    else:
+        senal = "ESPERAR"
+        direccion = 0
+
+    # Niveles orientativos calculados con ATR.
+    if direccion == 1:
         entrada = precio
-        sl = entrada - 1.5*atr
-        tp1 = entrada + 1.5*atr
-        tp2 = entrada + 2.5*atr
-        tp3 = entrada + 3.5*atr
-    elif bajista and bos != "BOS ALCISTA":
-        direccion = "VENTA POSIBLE"
+        sl = entrada - 1.5 * atr
+        tp1 = entrada + 1.5 * atr
+        tp2 = entrada + 2.5 * atr
+    elif direccion == -1:
         entrada = precio
-        sl = entrada + 1.5*atr
-        tp1 = entrada - 1.5*atr
-        tp2 = entrada - 2.5*atr
-        tp3 = entrada - 3.5*atr
+        sl = entrada + 1.5 * atr
+        tp1 = entrada - 1.5 * atr
+        tp2 = entrada - 2.5 * atr
+    else:
+        entrada = precio
+        sl = entrada - 1.5 * atr
+        tp1 = entrada + 1.5 * atr
+        tp2 = entrada + 2.5 * atr
 
-    # GRAFICO DE VELAS
-    archivo = f"/tmp/chali_{mercado.lower()}.png"
-    fig, ax = plt.subplots(figsize=(12, 7))
-    inicio = max(0, n-60)
+    # Dibujo del gráfico.
+    graf = df.tail(100).copy()
 
-    for i in range(inicio, n):
-        color = "green" if c[i] >= o[i] else "red"
-        ax.plot([i, i], [l[i], h[i]], color=color, linewidth=1)
-        cuerpo = max(abs(c[i]-o[i]), precio*0.00001)
-        ax.add_patch(patches.Rectangle(
-            (i-0.3, min(o[i], c[i])), 0.6, cuerpo,
-            facecolor=color, edgecolor=color
-        ))
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(graf["time"], graf["close"], label="Precio", linewidth=1.4)
+    ax.plot(graf["time"], graf["ema20"], label="EMA 20", linewidth=1)
+    ax.plot(graf["time"], graf["ema50"], label="EMA 50", linewidth=1)
 
-    ax.plot(range(inicio, n), e20[inicio:], label="EMA20")
-    ax.plot(range(inicio, n), e50[inicio:], label="EMA50")
+    ax.axhline(entrada, linestyle="--", label="Entrada")
+    ax.axhline(sl, linestyle=":", label="SL")
+    ax.axhline(tp1, linestyle=":", label="TP1")
+    ax.axhline(tp2, linestyle=":", label="TP2")
 
-    if ob:
-        ax.axhspan(ob[0], ob[1], alpha=0.2, label=ob[2])
-    if liq_alta is not None:
-        ax.axhline(liq_alta, linestyle=":", label="Liquidez alta")
-    if liq_baja is not None:
-        ax.axhline(liq_baja, linestyle=":", label="Liquidez baja")
-
-    if entrada is not None:
-        for nivel, etiqueta in [
-            (entrada, "ENTRADA"), (sl, "SL"),
-            (tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")
-        ]:
-            ax.axhline(nivel, linestyle="--", linewidth=1)
-            ax.text(n-1, nivel, f" {etiqueta} {nivel:.2f}", fontsize=8)
-
-    ax.set_title(f"CHALI IA SMC | {nombre} | 15m")
-    ax.set_ylabel(moneda)
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc="upper left", fontsize=8)
+    ax.set_title(f"CHALI IA | {nombre} | {TIMEFRAME}")
+    ax.set_xlabel("Hora UTC")
+    ax.set_ylabel("Precio")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %H:%M"))
+    fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(archivo, dpi=120)
+    fig.savefig(archivo, dpi=130)
     plt.close(fig)
 
-    texto = (
-        f"CHALI IA SMC - {nombre}\n"
-        f"Precio de referencia: {precio:.2f} {moneda}\n"
-        f"Direccion: {direccion}\n"
-        f"Estructura: {bos}\n"
-        f"CHOCH: {choch}\n"
-        f"Rebote: {rebote}\n"
-        f"ATR14: {atr:.2f}\n"
-    )
-
-    if ob:
-        texto += f"Order Block: {ob[2]} {ob[0]:.2f} - {ob[1]:.2f}\n"
+    zona_ob = estructura["ob_zona"]
+    if zona_ob:
+        zona_texto = f"{fmt(zona_ob[0])} - {fmt(zona_ob[1])}"
     else:
-        texto += "Order Block: no detectado\n"
+        zona_texto = "No calculada"
 
-    texto += (
-        f"Liquidez estimada sobre maximos: "
-        f"{liq_alta if liq_alta is not None else 'No detectada'}\n"
-        f"Liquidez estimada bajo minimos: "
-        f"{liq_baja if liq_baja is not None else 'No detectada'}\n"
+    informe = (
+        f"CHALI IA - {nombre}\n"
+        f"Temporalidad: {TIMEFRAME}\n"
+        f"Último cierre recibido: {fmt(precio)}\n"
+        f"Señal orientativa: {senal}\n\n"
+        f"ENTRADA de referencia: {fmt(entrada)}\n"
+        f"SL orientativo: {fmt(sl)}\n"
+        f"TP1 orientativo: {fmt(tp1)}\n"
+        f"TP2 orientativo: {fmt(tp2)}\n\n"
+        f"EMA20: {fmt(float(ult['ema20']))}\n"
+        f"EMA50: {fmt(float(ult['ema50']))}\n"
+        f"RSI: {rsi:.1f}\n"
+        f"ATR: {fmt(atr)}\n\n"
+        f"Estructura: {estructura['bos']}\n"
+        f"CHOCH: {estructura['choch']}\n"
+        f"Order Block: {estructura['ob']}\n"
+        f"Zona OB estimada: {zona_texto}\n"
+        f"Liquidez superior estimada: "
+        f"{fmt(estructura['liquidez_compra'])}\n"
+        f"Liquidez inferior estimada: "
+        f"{fmt(estructura['liquidez_venta'])}\n\n"
+        "Importante: análisis técnico aproximado. No confirma "
+        "liquidaciones reales ni garantiza resultados. "
+        "Verificá spread, comisiones y precio del broker antes de operar."
     )
 
-    if entrada is not None:
-        texto += (
-            f"\nEntrada orientativa: {entrada:.2f}\n"
-            f"Stop Loss: {sl:.2f}\n"
-            f"TP1: {tp1:.2f}\n"
-            f"TP2: {tp2:.2f}\n"
-            f"TP3: {tp3:.2f}\n"
+    resultado = {
+        "senal": senal,
+        "entrada": entrada,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2
+    }
+
+    guardar_resultado(nombre, resultado)
+
+    return archivo, informe
+
+
+# ---------------- IA GROQ + CONTEXTO ----------------
+
+def preguntar(chat_id, pregunta):
+    if not GROQ_API_KEY:
+        return (
+            "Falta GROQ_API_KEY en Render. "
+            "Agregala en Environment y volvé a probar."
         )
-    else:
-        texto += "\nSin entrada: esperar confirmacion.\n"
 
-    texto += (
-        "\nLas zonas son estimaciones tecnicas. No se consultan "
-        "liquidaciones reales del mercado. Sin ejecucion automatica."
+    recuerdos, historial = obtener_memoria(chat_id)
+
+    sistema = (
+        "Sos CHALI IA, asistente en español. "
+        "Ayudás con trading, programación y preguntas generales. "
+        "No afirmes que una señal está garantizada. "
+        "No inventes precios actuales: para analizarlos, pedí o generá "
+        "el análisis de mercado correspondiente. "
+        "Distinguí hechos de hipótesis. "
+        "No afirmes que te entrenaste automáticamente. "
+        "Usá los recuerdos guardados solo cuando sean relevantes.\n\n"
+        "RECUERDOS DEL USUARIO:\n"
+        + (recuerdos or "Todavía no hay recuerdos guardados.")
     )
 
-    return texto, archivo
+    mensajes = [{"role": "system", "content": sistema}]
+    mensajes.extend(historial[-10:])
+    mensajes.append({"role": "user", "content": pregunta})
+
+    try:
+        r = session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": mensajes,
+                "temperature": 0.4,
+                "max_tokens": 1200
+            },
+            timeout=45
+        )
+
+        if not r.ok:
+            logging.error("Groq error: %s", r.text[:1000])
+            return (
+                "Groq devolvió un error. Revisá GROQ_API_KEY, "
+                "GROQ_MODEL y los Logs de Render."
+            )
+
+        datos = r.json()
+        respuesta = datos["choices"][0]["message"]["content"].strip()
+
+        guardar_mensaje(chat_id, "user", pregunta)
+        guardar_mensaje(chat_id, "assistant", respuesta)
+
+        return respuesta
+
+    except Exception:
+        logging.exception("Error consultando Groq")
+        return "No pude conectar con Groq. Intentá de nuevo."
 
 
-# WEB Y TELEGRAM
+# ---------------- DETECTAR PETICIONES DE MERCADO ----------------
+
+def detectar_mercado(texto):
+    t = texto.lower()
+
+    palabras_grafico = [
+        "grafico", "gráfico", "graficame", "gráficame",
+        "chart", "velas", "candlestick", "analiza",
+        "analizá", "analizar", "analisis", "análisis",
+        "senal", "señal", "entrada", "operacion",
+        "operación", "mercado", "precio", "bos", "choch",
+        "order block", "liquidez", "rebote"
+    ]
+
+    pide_mercado = any(p in t for p in palabras_grafico)
+
+    oro = any(p in t for p in [
+        "oro", "xau", "xauusd", "gold"
+    ])
+
+    btc = any(p in t for p in [
+        "btc", "bitcoin", "btc/usdt", "btc usd"
+    ])
+
+    ambos = any(p in t for p in [
+        "ambos", "los dos", "los mercados", "oro y btc",
+        "btc y oro", "todo el mercado"
+    ])
+
+    if ambos:
+        return "AMBOS"
+
+    if oro and btc:
+        return "AMBOS"
+
+    if pide_mercado and oro:
+        return "ORO"
+
+    if pide_mercado and btc:
+        return "BTC"
+
+    return None
+
+
+# ---------------- COMANDOS TELEGRAM ----------------
+
+def procesar_mensaje(chat_id, texto):
+    texto = (texto or "").strip()
+    if not texto:
+        return
+
+    comando = texto.split()[0].split("@")[0].lower()
+
+    if comando in ("/start", "/ayuda", "/help"):
+        enviar_texto(
+            chat_id,
+            "CHALI IA está disponible.\n\n"
+            "/oro - Analizar oro y enviar gráfico\n"
+            "/btc - Analizar BTC y enviar gráfico\n"
+            "/mercados - Analizar oro y BTC\n"
+            "/memoria - Ver recuerdos guardados\n"
+            "/recordar texto - Guardar un recuerdo\n"
+            "/olvidar - Borrar recuerdos guardados\n\n"
+            "También podés escribir: "
+            "'Mostrame el gráfico del oro' o "
+            "'Analizá BTC con entrada, SL y TP'."
+        )
+        return
+
+    if comando == "/recordar":
+        recuerdo = texto[len("/recordar"):].strip()
+        if not recuerdo:
+            enviar_texto(chat_id, "Usá: /recordar tu recuerdo")
+            return
+        guardar_recuerdo(chat_id, recuerdo)
+        enviar_texto(chat_id, "Recuerdo guardado en la memoria.")
+        return
+
+    if comando == "/memoria":
+        recuerdos, _ = obtener_memoria(chat_id, limite=1)
+        enviar_texto(
+            chat_id,
+            "Tus recuerdos guardados:\n" +
+            (recuerdos or "Todavía no hay recuerdos.")
+        )
+        return
+
+    if comando == "/olvidar":
+        with db_lock:
+            con = conectar_db()
+            con.execute(
+                "DELETE FROM recuerdos WHERE chat_id = ?",
+                (str(chat_id),)
+            )
+            con.commit()
+            con.close()
+        enviar_texto(
+            chat_id,
+            "Borré los recuerdos guardados. "
+            "El historial de conversación se conserva."
+        )
+        return
+
+    mercado = detectar_mercado(texto)
+
+    if comando == "/oro":
+        mercado = "ORO"
+    elif comando == "/btc":
+        mercado = "BTC"
+    elif comando == "/mercados":
+        mercado = "AMBOS"
+
+    if mercado:
+        mercados = ["ORO", "BTC"] if mercado == "AMBOS" else [mercado]
+
+        for m in mercados:
+            try:
+                enviar_texto(chat_id, f"Analizando {m}. Esperá un momento...")
+                archivo, informe = analizar(m)
+                enviar_grafico(chat_id, archivo, informe)
+                guardar_mensaje(chat_id, "user", texto)
+                guardar_mensaje(chat_id, "assistant", informe)
+            except Exception as e:
+                logging.exception("Error analizando %s", m)
+                enviar_texto(
+                    chat_id,
+                    f"No pude analizar {m}.\n"
+                    f"Detalle: {str(e)[:700]}"
+                )
+        return
+
+    respuesta = preguntar(chat_id, texto)
+    enviar_texto(chat_id, respuesta)
+
+
+# ---------------- WEBHOOK DE TELEGRAM ----------------
+
 @app.route("/", methods=["GET"])
 def inicio():
-    return "CHALI IA ORO + BTC ONLINE", 200
+    return jsonify({
+        "app": "CHALI IA",
+        "estado": "online",
+        "mercados": ["ORO XAU/USD", "BTC/USDT"],
+        "timeframe": TIMEFRAME
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
-def salud():
-    return {"status": "online"}, 200
+def health():
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        return "CHALI webhook activo", 200
+        return jsonify({
+            "mensaje": "Webhook de CHALI IA activo"
+        }), 200
 
-    data = request.get_json(silent=True) or {}
-    mensaje = data.get("message", {})
-    chat = mensaje.get("chat", {}).get("id")
-    usuario = mensaje.get("from", {}).get("id")
-    texto = mensaje.get("text", "").strip()
+    if TELEGRAM_WEBHOOK_SECRET:
+        recibido = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token", ""
+        )
+        if recibido != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"error": "no autorizado"}), 403
 
-    if not chat or not texto:
-        return "OK", 200
+    update = request.get_json(silent=True) or {}
 
-    if ADMIN_ID and str(usuario) != ADMIN_ID:
-        enviar(chat, "Acceso no autorizado.")
-        return "OK", 200
+    mensaje = (
+        update.get("message")
+        or update.get("edited_message")
+    )
 
-    bajo = texto.lower()
+    if not mensaje:
+        return jsonify({"ok": True, "ignorado": True}), 200
+
+    chat = mensaje.get("chat", {})
+    chat_id = chat.get("id")
+    texto = mensaje.get("text", "")
+
+    if chat_id is None or not texto:
+        return jsonify({"ok": True, "ignorado": True}), 200
+
+    # Si se configura el ID administrador, limita el acceso.
+    if TELEGRAM_ADMIN_ID and str(chat_id) != TELEGRAM_ADMIN_ID:
+        logging.warning("Chat no autorizado: %s", chat_id)
+        return jsonify({"ok": True, "ignorado": True}), 200
 
     try:
-        if bajo.startswith("/start") or bajo.startswith("/ayuda"):
-            enviar(chat,
-                "CHALI IA - ORO + BTC\n\n"
-                "/oro - Analizar oro XAU/USD\n"
-                "/btc - Analizar BTCUSDT\n"
-                "/mercados - Analizar ambos\n"
-                "/recordar texto - Guardar memoria\n"
-                "/memoria - Ver memoria\n"
-                "/olvidar - Borrar memoria\n"
-                "Tambien puedes preguntarme cualquier cosa."
-            )
+        procesar_mensaje(chat_id, texto)
+    except Exception:
+        logging.exception("Error procesando mensaje Telegram")
 
-        elif bajo.startswith("/recordar "):
-            recuerdo = texto.split(" ", 1)[1].strip()
-            with conectar() as db:
-                db.execute(
-                    "INSERT INTO recuerdos(chat,texto) VALUES(?,?)",
-                    (str(chat), recuerdo[:1500])
-                )
-            enviar(chat, "Recuerdo guardado.")
+    return jsonify({"ok": True}), 200
 
-        elif bajo.startswith("/memoria"):
-            enviar(chat, memoria(chat))
 
-        elif bajo.startswith("/olvidar"):
-            with conectar() as db:
-                db.execute("DELETE FROM recuerdos WHERE chat=?",
-                           (str(chat),))
-            enviar(chat, "Memoria borrada.")
+# ---------------- CONFIGURAR WEBHOOK AUTOMATICAMENTE ----------------
 
-        elif bajo.startswith("/btc") or bajo.startswith("/oro"):
-            mercado = "BTC" if bajo.startswith("/btc") else "ORO"
-            enviar(chat, f"Analizando {mercado}, preparando grafico...")
-            try:
-                informe, grafico = analizar(mercado)
-                enviar_grafico(chat, informe, grafico)
-            except Exception as e:
-                print("Analisis error:", repr(e))
-                enviar(chat, "Error de analisis: " + str(e)[:500])
+def configurar_webhook():
+    if not TELEGRAM_TOKEN:
+        logging.warning("TELEGRAM_TOKEN no configurado")
+        return
 
-        elif bajo.startswith("/mercados"):
-            for mercado in ("ORO", "BTC"):
-                try:
-                    enviar(chat, f"Analizando {mercado}...")
-                    informe, grafico = analizar(mercado)
-                    enviar_grafico(chat, informe, grafico)
-                except Exception as e:
-                    enviar(chat, f"Error en {mercado}: {str(e)[:300]}")
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base_url:
+        logging.warning(
+            "RENDER_EXTERNAL_URL no está disponible; "
+            "configurá el webhook manualmente."
+        )
+        return
 
-        else:
-            enviar(chat, preguntar(chat, texto))
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN + "/setWebhook"
+    )
 
-    except Exception as e:
-        print("Webhook error:", repr(e))
+    datos = {"url": base_url + "/webhook"}
 
-    return "OK", 200
+    if TELEGRAM_WEBHOOK_SECRET:
+        datos["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+
+    try:
+        r = session.post(url, data=datos, timeout=20)
+        logging.info("Configurar webhook: %s", r.text[:500])
+    except Exception:
+        logging.exception("No se pudo configurar el webhook")
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    configurar_webhook()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+else:
+    # Gunicorn importa app.py; configuramos el webhook al arrancar.
+    configurar_webhook()
