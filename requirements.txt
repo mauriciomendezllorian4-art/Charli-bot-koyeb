@@ -1,6 +1,6 @@
 Flask
 requests
 matplotlib
-
+numpy
 gunicorn
 groq
