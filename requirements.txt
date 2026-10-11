@@ -1,7 +1,6 @@
-Flask
-requests
-matplotlib
-numpy
+flask
 gunicorn
-
+requests
 pandas
+numpy
+matplotlib
